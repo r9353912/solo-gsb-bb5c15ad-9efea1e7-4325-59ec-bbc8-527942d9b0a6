@@ -25,8 +25,6 @@ import {
   conflictIgnoredKey,
   detectConflicts,
   ignoredKey,
-  normalizeIgnored,
-  normalizeRules,
   pruneIgnored,
   type ConflictItem,
 } from './lib/conflicts'
@@ -40,8 +38,6 @@ import {
 import {
   diffSnapshot,
   makeBaseline,
-  normalizeBaseline,
-  normalizeReviewedDiffs,
   pruneReviewedDiffs,
   reviewedKey,
   type SnapshotDiffItem,
@@ -49,8 +45,6 @@ import {
 import {
   annotationContentSignature,
   buildSampleQueue,
-  normalizeSampleConfig,
-  normalizeSampleReviews,
   pruneSampleReviews,
   sampleReviewKey,
 } from './lib/sampling'
@@ -59,8 +53,6 @@ import {
   buildRelationViews,
   isSelfRelation,
   makeRelationId,
-  normalizeCardinalityRules,
-  normalizeRelations,
   relationKey,
   relationStats,
 } from './lib/relations'
@@ -74,6 +66,7 @@ import { ConflictRuleEditor } from './components/ConflictRuleEditor'
 import { TagRenameEditor } from './components/TagRenameEditor'
 import { badgeColor } from './lib/segments'
 import { buildReviewReport, downloadHtmlFile } from './lib/report'
+import { buildImportDocument } from './lib/importDoc'
 
 type PopoverState =
   | { kind: 'create'; range: { start: number; end: number }; rect: ViewRect }
@@ -906,103 +899,56 @@ export default function App() {
   }
 
   const importJson = async (file: File) => {
+    let parsed: unknown
     try {
-      const parsed = JSON.parse(await file.text()) as ExportPayload
-      if (parsed.format !== 'anchor-annotation-console' || typeof parsed.document?.text !== 'string') {
-        alert('无法识别的文件格式，请选择本工具导出的 JSON。')
-        return
-      }
-      if (
-        !confirm(
-          `导入「${parsed.document.title}」将替换当前文档（当前本地数据可先导出备份）。是否继续？`,
-        )
-      ) {
-        return
-      }
-      const annotations: Annotation[] = parsed.annotations.map((x, i) => ({
-        id: x.id || `imp_${i}`,
-        quote: x.quote,
-        start: x.position?.start ?? 0,
-        end: x.position?.end ?? 0,
-        note: x.note,
-        tags: x.tags,
-        status: x.status,
-        createdAt: x.createdAt ? Date.parse(x.createdAt) || Date.now() : Date.now(),
-        updatedAt: x.updatedAt ? Date.parse(x.updatedAt) || Date.now() : Date.now(),
-        contextBefore: x.context?.before ?? '',
-        contextAfter: x.context?.after ?? '',
-        pendingReason: x.pendingReason ?? undefined,
-        lastRelocation: x.lastRelocation ?? undefined,
-      }))
-      const conflictRules = normalizeRules(parsed.conflictRules)
-      // 旧版导出文件不含基线 / 已审记录：无损补空
-      const baselineRaw = parsed.baseline
-      const baseline =
-        baselineRaw && typeof baselineRaw === 'object'
-          ? normalizeBaseline({
-              createdAt: baselineRaw.createdAt,
-              annotations: (baselineRaw.annotations ?? []).map((b) => ({
-                id: b.id,
-                status: b.status,
-                quote: b.quote,
-                note: b.note,
-                tags: b.tags,
-                start: b.position?.start ?? 0,
-                end: b.position?.end ?? 0,
-              })),
-            })
-          : null
-      // 仅保留仍能命中导入后差异的已审记录
-      const reviewedDiffs = pruneReviewedDiffs(
-        normalizeReviewedDiffs(parsed.reviewedDiffs),
-        diffSnapshot(baseline, annotations),
-      )
-      // 旧版导出文件不含抽样配置：无损补空
-      const sampleConfig = normalizeSampleConfig(parsed.sampleConfig)
-      // 仅保留引用的标注仍存在、仍已绑定且内容签名一致的复核结论
-      const sampleReviews = pruneSampleReviews(
-        normalizeSampleReviews(parsed.sampleReviews),
-        annotations,
-      )
-      // 旧版导出文件不含标注关系：无损补空。
-      // 有效性不在导入时裁决：引用待处理 / 已不存在标注的关系保留为失效记录，
-      // 重新绑定后可自动恢复（引用完全缺失 ID 时只显示失效，不丢弃）。
-      const relations = normalizeRelations(parsed.relations)
-      // 旧版导出文件不含基数上限规则：无损补空；规则只按类型生效，与关系是否存在无关
-      const relationCardinalityRules = normalizeCardinalityRules(parsed.relationCardinalityRules)
-      setDoc({
-        title: parsed.document.title,
-        text: parsed.document.text,
-        annotations,
-        // 旧版导出文件不含冲突配置：无损补空；忽略记录引用已删标注/规则的在此剔除
-        conflictRules,
-        ignoredConflicts: pruneIgnored(
-          normalizeIgnored(parsed.ignoredConflicts),
-          annotations,
-          conflictRules,
-        ),
-        // 旧版导出文件不含覆盖审计配置：无损补空
-        coverageTags: normalizeCoverageTags(parsed.coverageTags),
-        baseline,
-        reviewedDiffs,
-        sampleConfig,
-        sampleReviews,
-        relations,
-        relationCardinalityRules,
-        updatedAt: Date.now(),
-      })
-      setMode('view')
-      setPopover(null)
-      setRebindId(null)
-      setActiveId(null)
-      setActivePairIds(null)
-      setActiveCoverage(null)
-      setActiveQuoteRange(null)
+      parsed = JSON.parse(await file.text())
     } catch {
       alert('文件解析失败，请确认是有效的 JSON 导出文件。')
-    } finally {
       if (fileInputRef.current) fileInputRef.current.value = ''
+      return
     }
+
+    // 写入前完整校验标注数组：ID 非空且全局唯一、已绑定区间为原文内非空整数半开区间、
+    // 区间文字与引文一致。任一记录不合格即拒绝整次导入，当前文档保持原样。
+    const result = buildImportDocument(parsed)
+    if (!result.ok) {
+      if (result.formatError) {
+        alert(result.formatError)
+      } else {
+        // 指出每条不合格记录的序号与原因；过多时只预览前 20 条
+        const lines = result.errors.map(
+          (e) => `第 ${e.index} 条标注：${e.reason}`,
+        )
+        const shown = lines.slice(0, 20).join('\n')
+        const rest =
+          lines.length > 20 ? `\n……另有 ${lines.length - 20} 条不合格记录。` : ''
+        alert(
+          `导入被拒绝：标注数组未通过校验（共 ${lines.length} 条记录不合格），当前文档未改动。\n\n${shown}${rest}`,
+        )
+      }
+      if (fileInputRef.current) fileInputRef.current.value = ''
+      return
+    }
+
+    const imported = result.document
+    if (
+      !confirm(
+        `导入「${imported.title}」将替换当前文档（当前本地数据可先导出备份）。是否继续？`,
+      )
+    ) {
+      if (fileInputRef.current) fileInputRef.current.value = ''
+      return
+    }
+
+    setDoc(imported)
+    setMode('view')
+    setPopover(null)
+    setRebindId(null)
+    setActiveId(null)
+    setActivePairIds(null)
+    setActiveCoverage(null)
+    setActiveQuoteRange(null)
+    if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
   const newDocument = () => {

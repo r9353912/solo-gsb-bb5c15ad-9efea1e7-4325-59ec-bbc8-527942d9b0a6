@@ -2256,4 +2256,243 @@ container3.remove()
   cp2.remove()
 }
 
+// 导入 JSON：标注数组完整校验——重复 ID / 区间与引文不符时拒绝整次导入、当前文档保持原样；
+// 合法文件（含旧版缺省可选分区）可导入，侧栏 / 关系 / 快照 / 抽样只引用各自标注
+{
+  const importText = '零一二三四五六七八九'
+  const mkAnn = (over: Record<string, unknown> = {}) => ({
+    id: 'imp_a',
+    status: 'bound',
+    quote: importText.slice(0, 2),
+    note: '',
+    tags: [],
+    position: { start: 0, end: 2 },
+    context: { before: '', after: '' },
+    pendingReason: null,
+    lastRelocation: null,
+    createdAt: '2026-09-20T00:00:00.000Z',
+    updatedAt: '2026-09-20T00:00:00.000Z',
+    ...over,
+  })
+  const mkPayload = (annotations: unknown[], extra: Record<string, unknown> = {}) => ({
+    format: 'anchor-annotation-console',
+    version: 1,
+    exportedAt: '2026-09-28T00:00:00.000Z',
+    document: { title: '导入目标文档', text: importText, annotationCount: annotations.length },
+    annotations,
+    ...extra,
+  })
+
+  // 当前文档：导入失败时必须原样保留
+  const beforeDoc = {
+    title: '导入前文档',
+    text: importText,
+    updatedAt: Date.now(),
+    annotations: [
+      {
+        id: 'before_a',
+        quote: importText.slice(3, 5),
+        start: 3,
+        end: 5,
+        note: '导入前备注',
+        tags: ['旧标签'],
+        status: 'bound' as const,
+        createdAt: 1,
+        updatedAt: 1,
+        contextBefore: '',
+        contextAfter: '',
+      },
+    ],
+  }
+  localStorage.setItem('anchor-annotation-console:v1', JSON.stringify(beforeDoc))
+  const ci = document.createElement('div')
+  ci.id = 'rootimport'
+  document.body.appendChild(ci)
+  const ir = createRoot(ci)
+
+  await new Promise<void>((resolve) => {
+    ir.render(React.createElement(React.StrictMode, null, React.createElement(App)))
+    setTimeout(resolve, 400)
+  })
+
+  const wait = () => new Promise<void>((resolve) => setTimeout(resolve, 150))
+  const fileInput = () => ci.querySelector('input[type=file]') as HTMLInputElement
+  // jsdom 不允许直接给 input.files 赋值：用定义访问器的方式注入一个 File
+  const chooseFile = (obj: unknown) => {
+    const input = fileInput()
+    const file = new window.File([JSON.stringify(obj)], '导入.json', {
+      type: 'application/json',
+    })
+    Object.defineProperty(input, 'files', {
+      configurable: true,
+      value: Object.assign([file], { 0: file, length: 1, item: () => file }),
+    })
+    input.dispatchEvent(new window.Event('change', { bubbles: true }))
+  }
+
+  // 1. 重复 ID：alert 指出第 2 条重复，文档与本地存储不变
+  const alerts: string[] = []
+  const prevAlert = window.alert
+  window.alert = (msg: string) => alerts.push(String(msg))
+  ;(globalThis as unknown as { alert: (msg?: unknown) => void }).alert = window.alert as (msg?: unknown) => void
+  let confirmed = 0
+  window.confirm = () => {
+    confirmed++
+    return true
+  }
+  ;(globalThis as unknown as { confirm: () => boolean }).confirm = window.confirm
+
+  chooseFile(
+    mkPayload([
+      mkAnn({ id: 'dup', quote: importText.slice(0, 1), position: { start: 0, end: 1 } }),
+      mkAnn({ id: 'dup', quote: importText.slice(1, 2), position: { start: 1, end: 2 } }),
+    ]),
+  )
+  await wait()
+  assert.strictEqual(alerts.length, 1, '应弹出一次拒绝提示')
+  assert.ok(alerts[0]!.includes('第 2 条标注'), `提示应指出序号：${alerts[0]}`)
+  assert.ok(alerts[0]!.includes('重复'), `提示应说明原因：${alerts[0]}`)
+  assert.strictEqual(confirmed, 0, '校验失败不得弹出替换确认框')
+  assert.ok(ci.innerHTML.includes('导入前文档'), '界面应仍是导入前文档')
+  {
+    const still = JSON.parse(localStorage.getItem('anchor-annotation-console:v1')!)
+    assert.strictEqual(still.title, '导入前文档')
+    assert.deepStrictEqual(still.annotations.map((a: { id: string }) => a.id), ['before_a'])
+  }
+  alerts.length = 0
+
+  // 2. 区间文字与引文不符：拒绝并指出第 1 条
+  chooseFile(
+    mkPayload([mkAnn({ id: 'imp_a', quote: '错文', position: { start: 0, end: 2 } })]),
+  )
+  await wait()
+  assert.strictEqual(alerts.length, 1)
+  assert.ok(alerts[0]!.includes('第 1 条标注'), `提示应指出序号：${alerts[0]}`)
+  assert.ok(alerts[0]!.includes('不符'), `提示应说明区间与引文不符：${alerts[0]}`)
+  assert.ok(ci.innerHTML.includes('导入前文档'))
+  {
+    const still = JSON.parse(localStorage.getItem('anchor-annotation-console:v1')!)
+    assert.deepStrictEqual(still.annotations.map((a: { id: string }) => a.id), ['before_a'])
+  }
+  alerts.length = 0
+
+  // 3. 区间越界 / 空区间同样被拒
+  chooseFile(mkPayload([mkAnn({ quote: importText.slice(0, 2), position: { start: 0, end: 99 } })]))
+  await wait()
+  assert.ok(alerts[0]!.includes('超出原文范围'))
+  alerts.length = 0
+  chooseFile(mkPayload([mkAnn({ quote: '', position: { start: 2, end: 2 } })]))
+  await wait()
+  assert.ok(alerts[0]!.includes('start < end'))
+  alerts.length = 0
+
+  // 4. 无法识别的格式：通用格式提示
+  chooseFile({ hello: 'world' })
+  await wait()
+  assert.ok(alerts[0]!.includes('无法识别的文件格式'))
+  alerts.length = 0
+
+  // 5. 合法文件成功导入：标注、侧栏、关系、快照、抽样均指向导入后的标注
+  const validPayload = mkPayload(
+    [
+      mkAnn({ id: 'new_a', quote: importText.slice(0, 2), position: { start: 0, end: 2 }, tags: ['甲'] }),
+      mkAnn({ id: 'new_b', quote: importText.slice(2, 4), position: { start: 2, end: 4 }, tags: ['乙'] }),
+      {
+        id: 'new_p',
+        status: 'pending',
+        quote: '消失的引文ZZZ',
+        note: '',
+        tags: [],
+        position: null,
+        context: { before: '', after: '' },
+        pendingReason: '原文中已找不到该引文，需要手动重新选择',
+        createdAt: '2026-09-20T00:00:00.000Z',
+        updatedAt: '2026-09-20T00:00:00.000Z',
+      },
+    ],
+    {
+      // 关系只引用导入标注；引用旧文档 ID 的关系保留为失效记录，不串到导入标注
+      relations: [
+        { id: 'rel_ok', sourceId: 'new_a', targetId: 'new_b', type: '支撑', createdAt: 'x' },
+        { id: 'rel_gone', sourceId: 'new_a', targetId: 'before_a', type: '引用', createdAt: 'x' },
+      ],
+      baseline: {
+        createdAt: '2026-09-19T00:00:00.000Z',
+        annotations: [
+          { id: 'new_a', status: 'bound', quote: importText.slice(0, 2), note: '', tags: ['甲'], position: { start: 0, end: 2 } },
+          // 基线中已不存在的标注：呈现为删除差异，不与新标注串项
+          { id: 'old_only', status: 'bound', quote: '旧', note: '', tags: [], position: { start: 0, end: 1 } },
+        ],
+      },
+      sampleConfig: {
+        seed: '导入种子',
+        targets: [{ tag: '甲', count: 1 }],
+        createdAt: 'x',
+        updatedAt: 'x',
+      },
+      sampleReviews: [],
+    },
+  )
+  chooseFile(validPayload)
+  await wait()
+  assert.strictEqual(confirmed, 1, '合法文件应弹出一次替换确认')
+  assert.strictEqual(alerts.length, 0, '合法文件不应有错误提示')
+  assert.ok(ci.innerHTML.includes('导入目标文档'), '界面应切换为导入后的文档')
+  {
+    const now = JSON.parse(localStorage.getItem('anchor-annotation-console:v1')!)
+    assert.strictEqual(now.title, '导入目标文档')
+    assert.deepStrictEqual(
+      now.annotations.map((a: { id: string }) => a.id),
+      ['new_a', 'new_b', 'new_p'],
+    )
+    // 侧栏：新标注渲染为高亮，旧标注不存在
+    assert.ok(ci.innerHTML.includes('消失的引文ZZZ'), '待处理导入标注应出现在侧栏')
+    assert.ok(!ci.innerHTML.includes('导入前备注'), '旧文档标注不应残留')
+    // 关系：new_a→new_b 有效；引用旧 ID 的一条保留为失效
+    const relSection = ci.querySelector('.relations-section') as HTMLElement
+    assert.ok(/有效\s*1\s*条/.test(relSection.textContent!), '应有 1 条有效关系')
+    assert.ok(/失效\s*1\s*条/.test(relSection.textContent!), '引用缺失标注的关系应为失效')
+    assert.ok(relSection.textContent!.includes('目标标注已删除'), '失效原因应为目标标注已删除')
+    // 快照：基线中 old_only 呈现删除差异，按各自 ID 对齐，不串到 new_* 标注
+    assert.ok(ci.innerHTML.includes('快照对比'), '应渲染快照对比分区')
+    const removedCard = ci.querySelector('.snap-item.snap-removed') as HTMLElement
+    assert.ok(removedCard, '基线中已不存在的 old_only 应呈现删除差异卡片')
+    assert.ok(removedCard.textContent!.includes('旧'), '删除差异应展示基线快照自身的引文，不串到导入标注')
+    assert.ok(!removedCard.textContent!.includes('new_a'), '删除差异不应套用导入标注内容')
+    // 抽样：配置导入后只从导入标注 new_a（#甲、已绑定）取样
+    const stored = now.sampleConfig
+    assert.strictEqual(stored.seed, '导入种子')
+    assert.deepStrictEqual(stored.targets, [{ tag: '甲', count: 1 }])
+    // 抽样队列只引用导入后的标注（new_a 命中 #甲），旧文档 before_a 不参与
+    const sampleCards = [...ci.querySelectorAll('.sample-item .sample-quote')].map((e) => e.textContent)
+    assert.deepStrictEqual(sampleCards, [importText.slice(0, 2)], '抽样队列应只含导入标注 new_a')
+  }
+
+  // 6. 旧版缺省可选分区（只有 document + annotations）仍可导入
+  const legacyObj = {
+    format: 'anchor-annotation-console',
+    version: 1,
+    document: { title: '旧版导入', text: importText, annotationCount: 1 },
+    annotations: [
+      mkAnn({ id: 'leg_a', quote: importText.slice(5, 7), position: { start: 5, end: 7 } }),
+    ],
+  }
+  chooseFile(legacyObj)
+  await wait()
+  assert.strictEqual(alerts.length, 0, '旧版缺省文件应直接通过校验')
+  {
+    const now = JSON.parse(localStorage.getItem('anchor-annotation-console:v1')!)
+    assert.strictEqual(now.title, '旧版导入')
+    assert.deepStrictEqual(now.annotations.map((a: { id: string }) => a.id), ['leg_a'])
+    assert.deepStrictEqual(now.relations, [])
+    assert.strictEqual(now.baseline, null)
+    assert.strictEqual(now.sampleConfig, null)
+  }
+
+  window.alert = prevAlert
+  ir.unmount()
+  ci.remove()
+  console.log('  ✓ 导入 JSON：重复 ID / 区间引文不符拒绝整次导入且文档不变，合法与旧版文件可导入，关系快照抽样按各自 ID 引用')
+}
+
 console.log('\n全部渲染冒烟测试通过')
