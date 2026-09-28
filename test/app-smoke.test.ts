@@ -2256,4 +2256,204 @@ container3.remove()
   cp2.remove()
 }
 
+// JSON 导入校验：非法文件（重复 ID / 区间与引文不符）整次拒绝、当前文档与关联记录原样保留；
+// 用户在确认框取消也不落地；合法文件（含 pending 与关系、缺省可选分区的旧版形态）正常替换。
+{
+  const impText = '零一二三四五六七八九'
+  const boundAnn = (id: string, start: number, end: number, extra: Record<string, unknown> = {}) => ({
+    id,
+    status: 'bound',
+    quote: impText.slice(start, end),
+    note: '',
+    tags: [],
+    position: { start, end },
+    context: { before: '', after: '' },
+    pendingReason: null,
+    lastRelocation: null,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    ...extra,
+  })
+  const pendingAnn = (id: string) => ({
+    id,
+    status: 'pending',
+    quote: '消失的引文ZZZ',
+    note: '',
+    tags: [],
+    position: null,
+    context: { before: '', after: '' },
+    pendingReason: '原文中已找不到该引文，需要手动重新选择',
+    lastRelocation: null,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  })
+  const makePayload = (annotations: unknown[], extra: Record<string, unknown> = {}) => ({
+    format: 'anchor-annotation-console',
+    version: 1,
+    exportedAt: '2026-01-01T00:00:00.000Z',
+    document: { title: '导入新文档', text: impText, annotationCount: annotations.length },
+    annotations,
+    ...extra,
+  })
+
+  const beforeDoc = {
+    title: '导入前文档',
+    text: '导入前保留的原文内容',
+    updatedAt: Date.now(),
+    annotations: [
+      {
+        id: 'keep1',
+        quote: '保留',
+        start: 4,
+        end: 6,
+        note: '不应被覆盖',
+        tags: ['旧标签'],
+        status: 'bound' as const,
+        createdAt: 1,
+        updatedAt: 1,
+        contextBefore: '',
+        contextAfter: '',
+      },
+    ],
+  }
+  localStorage.setItem('anchor-annotation-console:v1', JSON.stringify(beforeDoc))
+  const ci = document.createElement('div')
+  ci.id = 'rootimport'
+  document.body.appendChild(ci)
+  const ir = createRoot(ci)
+  await new Promise<void>((resolve) => {
+    ir.render(React.createElement(React.StrictMode, null, React.createElement(App)))
+    setTimeout(resolve, 400)
+  })
+
+  const wait = () => new Promise<void>((resolve) => setTimeout(resolve, 150))
+  const saved = () => JSON.parse(localStorage.getItem('anchor-annotation-console:v1')!)
+  const fileInput = () => ci.querySelector('input[type=file]') as HTMLInputElement
+  const alerts: string[] = []
+  const oldAlert = window.alert
+  const oldConfirm = window.confirm
+  window.alert = (msg?: string) => {
+    alerts.push(String(msg ?? ''))
+  }
+  ;(globalThis as unknown as { alert: typeof window.alert }).alert = window.alert
+  let confirmResult = true
+  const confirmCalls: string[] = []
+  window.confirm = (msg?: string) => {
+    confirmCalls.push(String(msg ?? ''))
+    return confirmResult
+  }
+  ;(globalThis as unknown as { confirm: typeof window.confirm }).confirm = window.confirm
+
+  const pickImportFile = async (obj: unknown) => {
+    alerts.length = 0
+    const file = new window.File([JSON.stringify(obj)], 'export.json', {
+      type: 'application/json',
+    })
+    const input = fileInput()
+    Object.defineProperty(input, 'files', {
+      value: Object.assign([file], { 0: file, length: 1, item: () => file }),
+      configurable: true,
+    })
+    input.dispatchEvent(new window.Event('change', { bubbles: true }))
+    await wait()
+  }
+
+  // 1. 两条标注共用 ID → 拒绝，提示含序号；文档原样
+  await pickImportFile(makePayload([boundAnn('dup', 0, 1), boundAnn('dup', 1, 2)]))
+  assert.strictEqual(alerts.length, 1, '非法文件应只弹错误提示')
+  assert.ok(alerts[0]!.includes('导入失败'), `应提示导入失败：${alerts[0]}`)
+  assert.ok(alerts[0]!.includes('第 2 条标注：'), '应指出重复记录的序号')
+  assert.ok(alerts[0]!.includes('与第 1 条记录重复'), '应指出与哪条重复')
+  assert.strictEqual(confirmCalls.length, 0, '校验失败不得进入替换确认')
+  assert.strictEqual(saved().title, '导入前文档', '当前文档标题应原样保留')
+  assert.strictEqual(saved().annotations[0].id, 'keep1')
+  assert.strictEqual(saved().annotations[0].note, '不应被覆盖')
+  assert.ok(ci.textContent!.includes('导入前文档'), '界面仍显示旧文档')
+  assert.ok(!ci.textContent!.includes('导入新文档'), '界面不应出现新文档标题')
+
+  // 2. 已绑定区间文字与引文不符 → 拒绝并指出序号与原因
+  await pickImportFile(makePayload([boundAnn('bad', 0, 2, { quote: '错误引文' })]))
+  assert.ok(alerts[0]!.includes('第 1 条标注：'))
+  assert.ok(alerts[0]!.includes('区间文字与引文不符'))
+  assert.strictEqual(saved().title, '导入前文档')
+
+  // 3. 区间越界（end 超过原文长度）→ 拒绝
+  await pickImportFile(makePayload([boundAnn('oob', 8, 99)]))
+  assert.ok(alerts[0]!.includes('超出原文范围'))
+  assert.strictEqual(saved().annotations.length, 1)
+
+  // 4. 合法文件但用户在确认框取消 → 不落地
+  confirmResult = false
+  await pickImportFile(makePayload([boundAnn('imp_a', 0, 2), boundAnn('imp_b', 3, 5)]))
+  assert.strictEqual(alerts.length, 0, '合法文件不应弹错误')
+  assert.strictEqual(confirmCalls.length, 1)
+  assert.strictEqual(saved().title, '导入前文档', '取消确认后文档保持原样')
+
+  // 5. 合法文件确认 → 整体替换：bound + pending + 关系；侧栏与关系只引用新标注
+  confirmResult = true
+  await pickImportFile(
+    makePayload(
+      [boundAnn('imp_a', 0, 2), boundAnn('imp_b', 3, 5), pendingAnn('imp_p')],
+      {
+        relations: [
+          {
+            id: 'imp_r1',
+            sourceId: 'imp_a',
+            targetId: 'imp_b',
+            type: '支撑',
+            createdAt: '2026-01-02T00:00:00.000Z',
+          },
+        ],
+      },
+    ),
+  )
+  assert.deepStrictEqual(alerts, [], '合法导入不应有错误提示')
+  const after = saved()
+  assert.strictEqual(after.title, '导入新文档')
+  assert.strictEqual(after.text, impText)
+  assert.deepStrictEqual(
+    after.annotations.map((a: { id: string }) => a.id),
+    ['imp_a', 'imp_b', 'imp_p'],
+    '旧标注应被整体替换，侧栏只引用各自新标注',
+  )
+  assert.strictEqual(after.annotations[2].status, 'pending')
+  assert.strictEqual(after.annotations[2].start, 0)
+  assert.strictEqual(after.relations.length, 1)
+  assert.strictEqual(after.relations[0].sourceId, 'imp_a')
+  assert.ok(ci.textContent!.includes('导入新文档'), '界面应显示新文档标题')
+  assert.ok(!ci.textContent!.includes('导入前文档'))
+  // 关系两端均已绑定 → 有效 1 条（关系按新 ID 查找，不串到旧 keep1）
+  const relSection = ci.querySelector('.relations-section') as HTMLElement
+  assert.ok(relSection, '应渲染关系分区')
+  assert.ok(/有效\s*1\s*条/.test(relSection.textContent!), '导入的关系应派生为有效')
+  assert.ok(relSection.textContent!.includes('零一'), '关系端应展示新标注引文')
+
+  // 6. 旧版形态（缺省全部可选分区，只有 document + annotations）可导入
+  const legacy = {
+    format: 'anchor-annotation-console',
+    document: { title: '旧版导出', text: impText },
+    annotations: [boundAnn('leg_a', 9, 10)],
+  }
+  await pickImportFile(legacy)
+  const afterLegacy = saved()
+  assert.deepStrictEqual(alerts, [], '旧版缺省可选分区的文件应可导入')
+  assert.strictEqual(afterLegacy.title, '旧版导出')
+  assert.deepStrictEqual(
+    afterLegacy.annotations.map((a: { id: string }) => a.id),
+    ['leg_a'],
+  )
+  assert.deepStrictEqual(afterLegacy.relations, [])
+  assert.deepStrictEqual(afterLegacy.conflictRules, [])
+  assert.strictEqual(afterLegacy.baseline, null)
+  assert.strictEqual(afterLegacy.sampleConfig, null)
+
+  window.alert = oldAlert
+  ;(globalThis as unknown as { alert: typeof window.alert }).alert = oldAlert
+  window.confirm = oldConfirm
+  ;(globalThis as unknown as { confirm: typeof window.confirm }).confirm = oldConfirm
+  ir.unmount()
+  ci.remove()
+  console.log('  ✓ JSON 导入：ID 唯一与区间-引文校验失败整次拒绝且文档原样，取消不落地，合法与旧版文件正常替换')
+}
+
 console.log('\n全部渲染冒烟测试通过')

@@ -74,6 +74,7 @@ import { ConflictRuleEditor } from './components/ConflictRuleEditor'
 import { TagRenameEditor } from './components/TagRenameEditor'
 import { badgeColor } from './lib/segments'
 import { buildReviewReport, downloadHtmlFile } from './lib/report'
+import { validateImportFile } from './lib/importDocument'
 
 type PopoverState =
   | { kind: 'create'; range: { start: number; end: number }; rect: ViewRect }
@@ -908,32 +909,27 @@ export default function App() {
   const importJson = async (file: File) => {
     try {
       const parsed = JSON.parse(await file.text()) as ExportPayload
-      if (parsed.format !== 'anchor-annotation-console' || typeof parsed.document?.text !== 'string') {
-        alert('无法识别的文件格式，请选择本工具导出的 JSON。')
+      // 写入前先完整校验：标注 ID 非空且全局唯一、已绑定区间是原文内非空整数半开区间
+      // 且区间文字等于引文。任一记录不合格即拒绝整次导入，当前文档与关联记录保持原样。
+      const validation = validateImportFile(parsed)
+      if (validation.errors.length > 0) {
+        alert(
+          `导入失败，已取消整次导入（当前文档未改动）：\n\n${validation.errors.join('\n')}`,
+        )
         return
       }
+      const importTitle =
+        typeof parsed.document?.title === 'string' ? parsed.document.title : '未命名文档'
       if (
         !confirm(
-          `导入「${parsed.document.title}」将替换当前文档（当前本地数据可先导出备份）。是否继续？`,
+          `导入「${importTitle}」将替换当前文档（当前本地数据可先导出备份）。是否继续？`,
         )
       ) {
         return
       }
-      const annotations: Annotation[] = parsed.annotations.map((x, i) => ({
-        id: x.id || `imp_${i}`,
-        quote: x.quote,
-        start: x.position?.start ?? 0,
-        end: x.position?.end ?? 0,
-        note: x.note,
-        tags: x.tags,
-        status: x.status,
-        createdAt: x.createdAt ? Date.parse(x.createdAt) || Date.now() : Date.now(),
-        updatedAt: x.updatedAt ? Date.parse(x.updatedAt) || Date.now() : Date.now(),
-        contextBefore: x.context?.before ?? '',
-        contextAfter: x.context?.after ?? '',
-        pendingReason: x.pendingReason ?? undefined,
-        lastRelocation: x.lastRelocation ?? undefined,
-      }))
+      // 校验阶段已保证：ID 非空且全局唯一；bound 区间在原文内、非空整数且 text.slice === quote；
+      // pending 无区间（start/end = 0）。侧栏、关系、快照、抽样按 ID 查找时只可能命中各自标注。
+      const annotations = validation.annotations
       const conflictRules = normalizeRules(parsed.conflictRules)
       // 旧版导出文件不含基线 / 已审记录：无损补空
       const baselineRaw = parsed.baseline
@@ -971,7 +967,7 @@ export default function App() {
       // 旧版导出文件不含基数上限规则：无损补空；规则只按类型生效，与关系是否存在无关
       const relationCardinalityRules = normalizeCardinalityRules(parsed.relationCardinalityRules)
       setDoc({
-        title: parsed.document.title,
+        title: importTitle,
         text: parsed.document.text,
         annotations,
         // 旧版导出文件不含冲突配置：无损补空；忽略记录引用已删标注/规则的在此剔除
